@@ -1,0 +1,10 @@
+defaults:
+  - system: mass_spring_damper
+  - simulation: default_sim
+  - controller: custom_mpc
+  - experiment: validate_custom_mpc
+  - logger: default_logger
+
+hydra:
+  run:
+    dir: "outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_${experiment.name}"

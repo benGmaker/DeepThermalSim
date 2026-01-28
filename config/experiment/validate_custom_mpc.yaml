@@ -1,0 +1,4 @@
+name: ValidateCustomMPC
+
+plot_figures: true
+save_figures: true

@@ -1,0 +1,5 @@
+hydra-core~=1.3.2
+numpy~=2.4.0
+matplotlib~=3.10.8
+omegaconf~=2.3.0
+control~=0.10.2

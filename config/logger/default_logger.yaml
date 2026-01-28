@@ -1,0 +1,6 @@
+log_root: logs
+console_level: "INFO"
+topics: [datalogger,
+         base_exp,
+         experiment,
+         dpc,]
