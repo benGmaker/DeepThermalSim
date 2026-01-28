@@ -117,6 +117,6 @@ class ValidateCustomMPC:
             save_path = Path(self.run_dir, "results.png")
             plt.savefig(save_path)
             self.log.info(f"Figure saved at {save_path}")
-        if self.cfg.experiment.show_figures:
+        if self.cfg.experiment.plot_figures:
             plt.show()
         plt.close()
