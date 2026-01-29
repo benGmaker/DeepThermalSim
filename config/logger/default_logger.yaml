@@ -3,4 +3,5 @@ console_level: "INFO"
 topics: [datalogger,
          base_exp,
          experiment,
-         dpc,]
+         dpc,
+         controller,]

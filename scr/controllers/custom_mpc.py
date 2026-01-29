@@ -76,40 +76,71 @@ def cvxpy_solver_mpc(plant, xref, uref, Ts, N):
     prob = cp.Problem(objective, constraints_cvx)
     solver_kwargs = dict(solver=cp.OSQP, warm_start=True, verbose=False)
 
-    def compute_trajectory(x_now, u_hold, **solver_kwargs):
-        # Solve the QP problem
-        x0_param.value = x_now  # Update initial state
-        xref_param.value = xref  # Reference trajectory
-
-        # Solve the problem and compute the next control input
+    # --- Precompute the initial output ---
+    def initialize_solver(x0, **solver_kwargs):
+        """Solve the initial MPC problem at t=0."""
+        logger.debug("[Initialize Solver] Precomputing initial control.")
+        x0_param.value = x0
+        xref_param.value = xref
         try:
             prob.solve(**solver_kwargs)
             if prob.status in ["optimal", "optimal_inaccurate"] and U[:, 0].value is not None:
-                u_next = U[:, 0].value
+                logger.debug("[Initialize Solver] Initial control precomputed.")
+                return np.atleast_1d(U[:, 0].value)  # Use the first valid control input
             else:
-                u_next = u_hold  # Fall back to previous input
-                logger.warning("CVXPY solver did not find an optimal solution, using previous control input.")
-        except Exception:
-            u_next = u_hold  # Robust fallback
-            logger.warning("CVXPY solver failed, using previous control input.")
-        
-        return np.atleast_1d(u_next)
+                logger.warning("[Initialize Solver] Precompute failed, using default [0.].")
+                return np.zeros(plant.ninputs)
+        except Exception as e:
+            logger.error(f"[Initialize Solver] Exception during precompute: {e}")
+            return np.zeros(plant.ninputs)  # Fallback default
+
+    # Precompute initial output
+    initial_state = np.zeros(nu)
+    initial_control = initialize_solver(np.zeros(nx), **solver_kwargs)
+
+    def compute_trajectory(x_now, u_hold, **solver_kwargs):
+        """Solve the MPC trajectory."""
+        logger.debug(f"[Compute Trajectory] Solving with state x_now={x_now}, u_hold={u_hold}")
+        x0_param.value = x_now
+        xref_param.value = xref
+        try:
+            prob.solve(**solver_kwargs)
+            logger.debug(f"[Compute Trajectory] Solver status: {prob.status}")
+            if prob.status in ["optimal", "optimal_inaccurate"] and U[:, 0].value is not None:
+                logger.debug(f"[Compute Trajectory] Optimal control: {U[:, 0].value}")
+                return np.atleast_1d(U[:, 0].value)
+            else:
+                logger.warning("[Compute Trajectory] MPC solve failed, using previous control input.")
+                return u_hold
+        except Exception as e:
+            logger.error(f"[Compute Trajectory] Solver exception: {e}")
+            return u_hold  # Fallback
 
     # --- Controller Memory ---
     def cvxmpc_update(t, u_hold, y_meas, params):
         x_now = np.array(y_meas).squeeze()  # Measured state
-        u_next = compute_trajectory(x_now, u_hold, **solver_kwargs)  # Solve QP
-        return u_next  # Update the controller state
+        logger.debug(f"[Update] t={t}, x_now={x_now}, u_hold={u_hold}")
+
+        if t == 0:
+            logger.debug("[Update] First timestep, solver already initialized.")
+            return initial_control  # Return the precomputed control for initialization
+
+        u_next = compute_trajectory(x_now, u_hold, **solver_kwargs)  # Solve MPC
+        logger.debug(f"[Update] Computed u_next={u_next}")
+        return u_next
 
     def cvxmpc_output(t, u_hold, y_meas, params):
-        # Output the held control value (computed at the last update step)
-        # No optimization or solver call is made here to avoid algebraic loops.
+        # Use the precomputed initial control for the very first output at t=0
+        if t == 0:
+            logger.debug(f"[Output] Using precomputed control at t=0: {initial_control}")
+            return initial_control  # Directly return precomputed output for first step
+        logger.debug(f"[Output] t={t}, u_hold={u_hold}")
         return np.atleast_1d(u_hold)
 
     # Declare the controller system
     cvx_mpc = ct.NonlinearIOSystem(
         cvxmpc_update, cvxmpc_output,
-        inputs=ny, outputs=nu, states=nu, dt=Ts,
+        inputs=ny, outputs=nu, states=nu, dt=Ts,  # <-- Fixed number of states
         name="cvx_mpc", params={"xref": xref}
     )
     return cvx_mpc
