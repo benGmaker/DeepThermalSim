@@ -58,7 +58,7 @@ class ValidateCustomMPC:
         self.log.info(f"Custom MPC computation time: {custom_time:.4f} s")
 
         # Validation metrics
-        position_diff = np.abs(xb[0] - xc[0])  # Position difference
+        position_diff = np.round(np.abs(xb[0] - xc[0]), 5) # Position difference
         self._log_validation_metrics(position_diff)
 
         # Plotting results
@@ -68,9 +68,14 @@ class ValidateCustomMPC:
         """Simulate the system and measure computation time."""
         start_time = time.time()
         self.log.info(f"Starting simulation at t = {start_time:.2f} s")
+        
         # Simulate system output (xb or xc)
         t, y = ct.input_output_response(system, time_vector, U=0)
-
+        
+        # Debugging: Log first and last few results
+        self.log.debug(f"Simulation results (first 5): {y[:, :5]}")
+        self.log.debug(f"Simulation results (last 5): {y[:, -5:]}")
+        
         final_time = time.time()
         self.log.info(f"Ending the simulation at t = {start_time:.2f} s")
         elapsed_time = final_time - start_time
@@ -79,7 +84,7 @@ class ValidateCustomMPC:
     def _log_validation_metrics(self, position_diff):
         """Log validation comparison metrics."""
         avg_pos_diff = np.mean(position_diff)
-        max_pos_diff = np.max(position_diff)
+        max_pos_diff = np.max(position_diff)        
         self.log.info(f"Average Position Difference: {avg_pos_diff:.4f}")
         self.log.info(f"Max Position Difference: {max_pos_diff:.4f}")
 
@@ -89,16 +94,16 @@ class ValidateCustomMPC:
 
         # Position and velocity trajectories
         plt.subplot(3, 1, 1)
-        plt.plot(T, xb[0], label='Position (Built-in MPC)')
-        plt.plot(T, xc[0], label='Position (CVX MPC)')
-        plt.plot(T, xref[0] * np.ones_like(T), 'k:', label='Reference Position')
+        plt.plot(T, xb[0], 'b', label='Position (Built-in MPC)')  # Solid blue line
+        plt.plot(T, xc[0], 'orange', linestyle='dotted', label='Position (CVX MPC)')  # Dotted orange line
+        plt.plot(T, xref[0] * np.ones_like(T), 'k:', label='Reference Position')  # Reference as dotted black line
         plt.ylabel('Position [m]')
         plt.legend()
         plt.grid(True)
 
         plt.subplot(3, 1, 2)
-        plt.plot(T, xb[1], label='Velocity (Built-in MPC)')
-        plt.plot(T, xc[1], label='Velocity (CVX MPC)')
+        plt.plot(T, xb[1], 'b-', label='Velocity (Built-in MPC)')  # Solid blue line
+        plt.plot(T, xc[1], 'orange', linestyle='dotted', label='Velocity (CVX MPC)')  # Dotted orange line
         plt.ylabel('Velocity [m/s]')
         plt.xlabel('Time [s]')
         plt.grid(True)
