@@ -1,2 +1,2 @@
 Ts: 0.05   # sampling time [s]
-Tsim: 8.0  # simulation length [s]
+Tsim: 0.5  # simulation length [s]

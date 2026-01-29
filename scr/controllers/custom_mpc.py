@@ -7,6 +7,7 @@ import numpy as np
 import control.optimal as opt
 import control as ct
 import cvxpy as cp # Solver
+import logging
 
 def solving_matrices(controller_cfg):
     # todo make this a configurable by cfg
@@ -46,13 +47,14 @@ def default_mpc(plant, xref, uref, Ts, N):
 
 
 def cvxpy_solver_mpc(plant, xref, uref, Ts, N):
+    logger = logging.getLogger('controller')
     nx, nu = plant.nstates, plant.ninputs
     ny = plant.noutputs
 
-    # --- weights and bounds (your helper) ---
+    # --- Weights and bounds ---
     Q, R, Qf, u_min, u_max = solving_matrices(plant)
 
-    # --- build the parameterized QP (unchanged) ---
+    # --- Build the QP ---
     X = cp.Variable((nx, N + 1))
     U = cp.Variable((nu, N))
     x0_param = cp.Parameter(nx)
@@ -74,29 +76,37 @@ def cvxpy_solver_mpc(plant, xref, uref, Ts, N):
     prob = cp.Problem(objective, constraints_cvx)
     solver_kwargs = dict(solver=cp.OSQP, warm_start=True, verbose=False)
 
-    # --- sampled-data controller with memory (hold) ---
-    def cvxmpc_update(t, u_hold, y_meas, params):
-        # y_meas must be the measured state; with C=I we get full state.
-        x_now = np.array(y_meas).squeeze()
-        x0_param.value = x_now
-        xref_param.value = params.get("xref", xref)
+    def compute_trajectory(x_now, u_hold, **solver_kwargs):
+        # Solve the QP problem
+        x0_param.value = x_now  # Update initial state
+        xref_param.value = xref  # Reference trajectory
 
+        # Solve the problem and compute the next control input
         try:
             prob.solve(**solver_kwargs)
             if prob.status in ["optimal", "optimal_inaccurate"] and U[:, 0].value is not None:
                 u_next = U[:, 0].value
             else:
-                u_next = u_hold  # keep previous command if solver fails
+                u_next = u_hold  # Fall back to previous input
+                logger.warning("CVXPY solver did not find an optimal solution, using previous control input.")
         except Exception:
-            u_next = u_hold  # robust fallback
+            u_next = u_hold  # Robust fallback
+            logger.warning("CVXPY solver failed, using previous control input.")
+        
+        return np.atleast_1d(u_next)
 
-        return np.atleast_1d(u_next)  # next controller *state*
+    # --- Controller Memory ---
+    def cvxmpc_update(t, u_hold, y_meas, params):
+        x_now = np.array(y_meas).squeeze()  # Measured state
+        u_next = compute_trajectory(x_now, u_hold, **solver_kwargs)  # Solve QP
+        return u_next  # Update the controller state
 
     def cvxmpc_output(t, u_hold, y_meas, params):
-        # Output the *held* control value to the plant at this sample
+        # Output the held control value (computed at the last update step)
+        # No optimization or solver call is made here to avoid algebraic loops.
         return np.atleast_1d(u_hold)
 
-    # ✅ Give the controller memory: states=nu (NOT zero)
+    # Declare the controller system
     cvx_mpc = ct.NonlinearIOSystem(
         cvxmpc_update, cvxmpc_output,
         inputs=ny, outputs=nu, states=nu, dt=Ts,
