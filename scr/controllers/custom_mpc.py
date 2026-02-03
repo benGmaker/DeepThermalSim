@@ -3,52 +3,91 @@ This script is an implementation of a custom MPC controller and a default one.
 The goal is to compare and validate a custom solution, such that we can build further on the custom solution.
 The accompanying experiment is: validate_custom_mpc.py
 """
-from typing import Tuple, List, Callable, Array 
+from typing import Tuple, List, Callable 
+from numpy.typing import ArrayLike
 import numpy as np
 import control.optimal as opt
 import control as ct
 import cvxpy as cp # Solver
 import logging
+import control.optimal as opt
 
-def solving_matrices(controller_cfg: dict) -> Tuple[Array, Array, Array, Array, Array]:
+topic = 'controller'
+
+def solving_matrices(cfg: dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Solves and returns matrices for control problem configuration.
     
     Args:
-        controller_cfg (dict): Placeholder configuration dictionary for additional customization.
+        controller_cfg (dict): Configuration dictionary for controller parameters.
 
     Returns:
-        Tuple[Array, Array, Array, Array, Array]: 
+        Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]: 
             Q, R, Qf, u_min, u_max matrices for quadratic programming and constraints.
     """
-    # Todo make these configurable via controller_cfg
-    Q = np.diag([15.0, 1.0])  # penalize position error more than velocity
-    R = np.diag([0.1])  # input effort
-    Qf = Q  # terminal weight (used via integral + terminal cost
-    u_min, u_max = np.array([-2.0]), np.array([2.0])
+    log = logging.getLogger(topic)
+    controller_cfg = cfg.controller
+
+    # Extract the number of states (nx) and number of inputs (nu) from the system configuration
+    system_cfg = cfg.system
+    nx = len(system_cfg.get("xref", []))  # Number of states, based on xref dimensions
+    nu = len(system_cfg.get("uref", []))  # Number of inputs, based on uref dimensions
+
+    # Initialize matrices with controller-provided values or defaults
+    Q = np.array(controller_cfg.get("Q", np.eye(nx) * 10))  # Default weights prioritize diagonals
+    R = np.array(controller_cfg.get("R", np.eye(nu) * 1))
+    Qf = np.array(controller_cfg.get("Qf", Q))  # Terminal state weight
+    u_min = np.array(controller_cfg.get("u_min", [-2.0] * nu))  # Input limits as per system input dimension
+    u_max = np.array(controller_cfg.get("u_max", [2.0] * nu))
+
+    # Validate dimensions of provided matrices and correct if necessary
+    if Q.shape != (nx, nx):
+        log.warning(f"Q dimensions {Q.shape} do not match system state size {nx}. Falling back to default.")
+        Q = np.eye(nx) * 10  # Default: Identity matrix scaled for nx
+
+    if R.shape != (nu, nu):
+        log.warning(f"R dimensions {R.shape} do not match system input size {nu}. Falling back to default.")
+        R = np.eye(nu) * 1  # Default: Identity matrix scaled for nu
+
+    if Qf.shape != (nx, nx):
+        log.warning(f"Qf dimensions {Qf.shape} do not match system state size {nx}. Falling back to default.")
+        Qf = Q  # Default: Terminal weight is same as Q
+
+    if len(u_min) != nu:
+        log.warning(f"u_min dimensions {len(u_min)} do not match system input size {nu}. Falling back to default.")
+        u_min = np.array([-2.0] * nu)  # Default lower bound for inputs
+
+    if len(u_max) != nu:
+        log.warning(f"u_max dimensions {len(u_max)} do not match system input size {nu}. Falling back to default.")
+        u_max = np.array([2.0] * nu)  # Default upper bound for inputs
 
     return Q, R, Qf, u_min, u_max
-
 def define_constraints(
-    plant: ct.InputOutputSystem, xref: Array, uref: Array, Ts: float, N: int
+    plant: ct.InputOutputSystem,
+    xref: ArrayLike,
+    uref: ArrayLike,
+    Ts: float,
+    N: int,
+    cfg: dict,
 ) -> Tuple[Callable, Callable, List[Callable]]:
     """
     Defines the constraints for the control problem.
 
     Args:
         plant (ct.InputOutputSystem): The controlled plant model.
-        xref (Array): Reference state trajectory.
-        uref (Array): Reference input trajectory.
+        xref (ArrayLike): Reference state trajectory.
+        uref (ArrayLike): Reference input trajectory.
         Ts (float): Sampling time.
         N (int): Horizon length.
+        cfg (dict): Configuration dictionary
 
     Returns:
         Tuple[Callable, Callable, List[Callable]]: Stage cost, terminal cost, and constraints.
     """
-    # Quadratic weights on states/inputs (state tracking to xref)
-    Q, R, Qf, u_min, u_max = solving_matrices(plant)
+    # Quadratic weights on states/inputs
+    Q, R, Qf, u_min, u_max = solving_matrices(cfg)
 
-    # Cost: use quadratic_cost on states/inputs around nominal (xref, uref)
+    # Cost: quadratic cost on states/inputs around nominal (xref, uref)
     stage_cost = opt.quadratic_cost(plant, Q, R, x0=xref, u0=uref)
     term_cost = opt.quadratic_cost(plant, Qf, np.zeros((1, 1)), x0=xref, u0=uref)
 
@@ -58,55 +97,66 @@ def define_constraints(
     return stage_cost, term_cost, constraints
 
 
-def default_mpc(plant: ct.InputOutputSystem, xref: Array, uref: Array, Ts: float, N: int
-    ) -> ct.InputOutputSystem:
+def default_mpc(
+    plant: ct.InputOutputSystem,
+    xref: ArrayLike,
+    uref: ArrayLike,
+    Ts: float,
+    N: int,
+    cfg: dict,
+) -> ct.InputOutputSystem:
     """
     Creates a default MPC controller using a predefined cost and constraints.
 
     Args:
-        plant (ct.InputOutputSystem): The plant model to control.
-        xref (Array): Reference state trajectory.
-        uref (Array): Reference input trajectory.
+        plant (ct.InputOutputSystem): Discrete-time plant model to control.
+        xref (ArrayLike): Reference state trajectory.
+        uref (ArrayLike): Reference input trajectory.
         Ts (float): Sampling time.
         N (int): Horizon length.
-
+        cfg (dict): Configuration dictionary
     Returns:
         ct.InputOutputSystem: The MPC I/O system.
     """
-    stage_cost, term_cost, constraints = define_constraints(plant, xref, uref, Ts, N)
+    stage_cost, term_cost, constraints = define_constraints(plant, xref, uref, Ts, N, cfg)
     timepts = np.arange(N) * Ts
     builtin_mpc = opt.create_mpc_iosystem(
         plant, timepts,
         integral_cost=stage_cost,
         terminal_cost=term_cost,
         trajectory_constraints=constraints,
-        # You can pass solver knobs: minimize_method="SLSQP", minimize_kwargs={...}
     )
     return builtin_mpc
 
 
 def cvxpy_solver_mpc(
-    plant: ct.InputOutputSystem, xref: Array, uref: Array, Ts: float, N: int
+    plant: ct.InputOutputSystem,
+    xref: ArrayLike,
+    uref: ArrayLike,
+    Ts: float,
+    N: int,
+    cfg: dict,
 ) -> ct.InputOutputSystem:
     """
     Configures an MPC controller using CVXPY as the optimization solver.
 
     Args:
-        plant (ct.InputOutputSystem): The plant model to control.
-        xref (Array): Reference state trajectory.
-        uref (Array): Reference input trajectory.
+        plant (ct.InputOutputSystem): Discrete-time plant model to control.
+        xref (ArrayLike): Reference state trajectory.
+        uref (ArrayLike): Reference input trajectory.
         Ts (float): Sampling time.
         N (int): Horizon length.
+        cfg (dict): Configuration dictionary.
 
     Returns:
         ct.InputOutputSystem: A nonlinear I/O system for online CVXPY-based MPC.
     """
-    logger = logging.getLogger('controller')
+    logger = logging.getLogger(topic)
     nx, nu = plant.nstates, plant.ninputs
     ny = plant.noutputs
 
     # --- Weights and bounds ---
-    Q, R, Qf, u_min, u_max = solving_matrices(plant)
+    Q, R, Qf, u_min, u_max = solving_matrices(cfg)
 
     # --- Build the QP ---
     X = cp.Variable((nx, N + 1))
@@ -131,7 +181,7 @@ def cvxpy_solver_mpc(
     solver_kwargs = dict(solver=cp.OSQP, warm_start=True, verbose=False)
 
     # --- Precompute the initial output ---
-    def initialize_solver(x0: Array, **solver_kwargs) -> Array:
+    def initialize_solver(x0: ArrayLike, **solver_kwargs) -> ArrayLike:
         """Solve the initial MPC problem at t=0."""
         logger.debug("[Initialize Solver] Precomputing initial control.")
         x0_param.value = x0
@@ -152,7 +202,8 @@ def cvxpy_solver_mpc(
     initial_state = np.zeros(nu)
     initial_control = initialize_solver(np.zeros(nx), **solver_kwargs)
 
-    def compute_trajectory(x_now: Array, u_hold: Array, **solver_kwargs) -> Array:
+
+    def compute_trajectory(x_now: ArrayLike, u_hold: ArrayLike, **solver_kwargs) -> ArrayLike:
         """Solve the MPC trajectory."""
         logger.debug(f"[Compute Trajectory] Solving with state x_now={x_now}, u_hold={u_hold}")
         x0_param.value = x_now
@@ -171,7 +222,7 @@ def cvxpy_solver_mpc(
             return u_hold  # Fallback
 
     # --- Controller Memory ---
-    def cvxmpc_update(t: float, u_hold: Array, y_meas: Array, params: dict) -> Array:
+    def cvxmpc_update(t: float, u_hold: ArrayLike, y_meas: ArrayLike, params: dict) -> ArrayLike:
         """Controller state update."""
         x_now = np.array(y_meas).squeeze()  # Measured state
         logger.debug(f"[Update] t={t}, x_now={x_now}, u_hold={u_hold}")
@@ -184,7 +235,7 @@ def cvxpy_solver_mpc(
         logger.debug(f"[Update] Computed u_next={u_next}")
         return u_next
 
-    def cvxmpc_output(t: float, u_hold: Array, y_meas: Array, params: dict) -> Array:
+    def cvxmpc_output(t: float, u_hold: ArrayLike, y_meas: ArrayLike, params: dict) -> ArrayLike:
         """Controller output definition."""
         # Use the precomputed initial control for the very first output at t=0
         if t == 0:

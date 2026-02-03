@@ -1,4 +1,5 @@
-from typing import Any, Dict, Array 
+from typing import Any, Dict
+from numpy.typing import ArrayLike 
 import numpy as np
 import control as ct
 import logging
@@ -40,10 +41,10 @@ def two_transistor_heat(system_cfg: Dict[str, Any]) -> ct.NonlinearIOSystem:
     logger = logging.getLogger(log_topic)
     logger.debug("Creating 2-transistor heat system model.")
 
-    if system_cfg.name != 'two_transistor_heat_system':
+    if system_cfg.name != 'two_transistor_heat':
         logger.warning(f"System configuration name '{system_cfg.name}' does not match expected 'two_transistor_heat_system'. "
                        "Mismatching or default parameters may be used.")
-    name = system_cfg.get('name', 'two_transistor_heat_system')
+    name = system_cfg.get('name', 'two_transistor_heat')
 
     # Parameters
     Ta = system_cfg.get('Ta', 25.0 + 273.15)  # Ambient temperature, K
@@ -57,7 +58,7 @@ def two_transistor_heat(system_cfg: Dict[str, Any]) -> ct.NonlinearIOSystem:
     eps = system_cfg.get('eps', 0.9)          # Emissivity of the surface
     sigma = system_cfg.get('sigma', 5.67e-8)    # Stefan-Boltzmann constant
 
-    def update_function(t, x, u, params) -> Array:
+    def update_function(t, x, u, params) -> ArrayLike:
         """Nonlinear state update function for the heat system."""
         # States
         T1 = x[0]  # Temperature of block 1
@@ -87,7 +88,7 @@ def two_transistor_heat(system_cfg: Dict[str, Any]) -> ct.NonlinearIOSystem:
 
         return np.array([dT1dt, dT2dt])
     
-    def output_function(t, x, u, params) -> Array:
+    def output_function(t, x, u, params) -> ArrayLike:
         """Output function for the heat system."""
         return x  # Output is the state itself (temperatures)
     

@@ -1,4 +1,19 @@
-name: mass_spring_damper_system 
+name: mass_spring_damper
+type: linear
 m: 1.0   # Mass [kg]
 d: 0.5   # Damping coefficient [Ns/m]
 k: 10.0  # Spring constant [N/m]
+
+# Default references
+xref: [1.0, 0.0]  # Target position = 1.0, target velocity = 0
+uref: [0.0]  # External force input starting at 0
+
+# Axis labeling and units (dynamic plot configuration)
+time_axis_label: "Time [s]"
+state_labels:          # Names for the plotted states
+  - "Position"
+  - "Velocity"
+state_units:           # Units for each state (shown on the Y-axis)
+  - "[m]"
+  - "[m/s]"
+diff_label: "Position Difference [m]"

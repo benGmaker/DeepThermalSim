@@ -1,2 +1,21 @@
 # 2 Transistor heaters model from https://apmonitor.com/pdc/index.php/Main/ArduinoModeling2
-name: two_transistor_heat_system
+name: two_transistor_heat
+type: nonlinear
+
+
+# Initial state of the system (temperatures in Kelvin for two-transistor heat, for example)
+initial_state: [300.0, 300.0]  # Default: ambient temperature
+
+# Default references
+xref: [323.15 , 323.15]
+uref: [0.0 , 0.0]
+
+# Axis labeling and units (dynamic plot configuration)
+time_axis_label: "Time [s]"
+state_labels:          # Names for the plotted states
+  - "Temperature T1"
+  - "Temperature T2"
+state_units:           # Units for each state (shown on the Y-axis)
+  - "[K]"
+  - "[K]"
+diff_label: "Temperature Difference [K]"
