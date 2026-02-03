@@ -1,3 +1,4 @@
+name: mass_spring_damper_system 
 m: 1.0   # Mass [kg]
 d: 0.5   # Damping coefficient [Ns/m]
 k: 10.0  # Spring constant [N/m]

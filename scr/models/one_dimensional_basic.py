@@ -1,5 +1,8 @@
 import numpy as np
 import control as ct
+import logging
+
+log_topic = 'model'
 
 def mass_spring_damper(system_cfg, sim_cfg) -> ct.c2d:
     """"
@@ -8,6 +11,8 @@ def mass_spring_damper(system_cfg, sim_cfg) -> ct.c2d:
     :param system_cfg:
     :param sim_cfg:
     """
+    logger = logging.getLogger(log_topic)
+    logger.debug("Creating mass-spring-damper system model.")
     k = system_cfg.k
     m = system_cfg.m
     d = system_cfg.d

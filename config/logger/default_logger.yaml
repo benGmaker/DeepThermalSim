@@ -2,6 +2,16 @@ log_root: logs
 console_level: "INFO"
 topics: [datalogger,
          base_exp,
+         controller,
          experiment,
-         dpc,
-         controller,]
+         model,
+         simulation,
+         utils,
+         ]
+
+# logging levels that exist:
+# DEBUG --- for detailed diagnostic information
+# INFO --- for tracking general events, progress, and high-level state changes
+# WARNING --- for indicating potential issues or important situations that are not errors
+# ERROR --- for logging errors that occur during execution
+# CRITICAL --- for logging severe errors that may cause the program to terminate
