@@ -2,7 +2,7 @@ defaults:
   - system: two_transistor_heat
   - simulation: default_sim
   - controller: custom_mpc
-  - experiment: validate_custom_mpc
+  - experiment: validate_custom_optimal_problem
   - logger: default_logger
 
 hydra:

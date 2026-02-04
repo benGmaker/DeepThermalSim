@@ -128,7 +128,6 @@ def default_mpc(
     )
     return builtin_mpc
 
-
 def cvxpy_solver_mpc(
     plant: ct.InputOutputSystem,
     xref: ArrayLike,

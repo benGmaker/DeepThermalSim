@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import control as ct
+import control.optimal as opt
 import time
 import logging
 from pathlib import Path
@@ -77,6 +78,7 @@ class ValidateCustomMPC:
         # Initialize both controllers with updated configuration
         builtin_mpc = custom_mpc.default_mpc(dt_ln_plant, xref, uref, Ts, N, self.cfg)
         cvx_mpc = custom_mpc.cvxpy_solver_mpc(dt_ln_plant, xref, uref, Ts, N, self.cfg)
+        opt.solve_optimal_trajectory()
 
         # Simulate and measure computation time for each controller
         T = np.arange(0, self.cfg.simulation.Tsim + Ts, Ts)
@@ -107,6 +109,7 @@ class ValidateCustomMPC:
         else:
             raise ValueError(f"Unknown system type: {self.cfg.system.type}")
 
+        ct.optimal.solve_optimal_trajectory()
         final_time = time.time()
         self.log.info(f"Ending the simulation at t = {final_time:.2f} s")
         elapsed_time = final_time - start_time

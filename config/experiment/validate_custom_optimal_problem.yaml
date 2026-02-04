@@ -1,0 +1,4 @@
+name: ValidateCustomOptimalProblem
+
+plot_figures: true
+save_figures: true
