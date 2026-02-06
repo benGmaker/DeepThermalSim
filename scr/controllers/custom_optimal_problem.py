@@ -13,31 +13,51 @@ import scipy.optimize as opt
 topic = 'controller'
 
 class CustomOptimalControlProblem(OptimalControlProblem):
-    def __init__(self, *args, Q=None, R=None, Qf=None, x0=None, u0=None, **kwargs):
+    def __init__(self, *args, Q=None, R=None, Qf=None, x0=None, u0=None, xf=None, uf=None, **kwargs):
         """
         Initialize the CustomOptimalControlProblem with explicit cost matrices.
         Automatically handles linearizing the system if it's nonlinear.
+        
+        Parameters
+        ----------
+        Q : ndarray
+            State cost matrix
+        R : ndarray
+            Input cost matrix
+        Qf : ndarray
+            Terminal state cost matrix
+        x0 : ndarray
+            Initial state for linearization
+        u0 : ndarray
+            Initial input for linearization
+        xf : ndarray
+            Reference/goal state
+        uf : ndarray
+            Reference/goal input
         """
         super().__init__(*args, **kwargs)
-        self.Q = Q  # State quadratic cost
-        self.R = R  # Input quadratic cost
-        self.Qf = Qf  # Terminal state quadratic cost
+        self.Q = Q
+        self.R = R
+        self.Qf = Qf
         self.logger = logging.getLogger(topic)
 
         # Store initial state and input
         self.x0 = np.atleast_1d(x0) if x0 is not None else None
         self.u0 = np.atleast_1d(u0) if u0 is not None else None
+        
+        # Store reference state and input for cost computation
+        self.xf = np.atleast_1d(xf) if xf is not None else None
+        self.uf = np.atleast_1d(uf) if uf is not None else None
 
-        # Ensure the initial state and input dimensions match the system's definition
+        # Ensure the initial state and input dimensions match
         if not self._validate_dimensions():
             raise ValueError("System, x0, and u0 dimensions do not match.")
 
         # Linearize the system if required
         if hasattr(self.system, "A") and hasattr(self.system, "B"):
-            self.A, self.B = self.system.A, self.system.B  # Already linear system
+            self.A, self.B = self.system.A, self.system.B
         else:
             self.logger.info("Linearizing the system...")
-            # ct.linearize returns a LinearIOSystem object, not a tuple
             linearized_sys = ct.linearize(self.system, self.x0, self.u0)
             self.A = linearized_sys.A
             self.B = linearized_sys.B
@@ -55,15 +75,6 @@ class CustomOptimalControlProblem(OptimalControlProblem):
     def _cvxpy_optimizer(self, fun, x0_opt, constraints, **kwargs):
         """
         CVXPY-based custom optimizer to minimize the cost function.
-        
-        Parameters
-        ----------
-        fun : callable
-            Cost function (not used in CVXPY, but kept for compatibility)
-        x0_opt : array
-            Initial guess for optimization
-        constraints : list
-            List of constraint objects
         """
         self.logger.info("Starting CVXPY optimization...")
 
@@ -73,14 +84,46 @@ class CustomOptimalControlProblem(OptimalControlProblem):
         X = cp.Variable((nx, N + 1))  # State trajectory (N+1 points)
         U = cp.Variable((nu, N + 1))  # Input trajectory (N+1 points to match time)
 
-        # Construct the objective function
+        # Reference trajectory (goal state and input)
+        # Extract from the cost functions passed during initialization
+        # The cost is defined as (x - xf)^T Q (x - xf) + (u - uf)^T R (u - uf)
+        # We need to get xf and uf from somewhere
+        # Let's add them as parameters
+        
+        # For now, we'll need to pass xf and uf to the optimizer
+        # Let's extract them from the problem definition
+        
+        # Construct the objective function with PROPER reference tracking
         cost_terms = []
+        
+        # Get reference values from integral_cost (they're embedded in the cost function)
+        # We need xf and uf - let's compute them from the initial guess or pass them explicitly
+        # For now, let's assume they should be stored in the class
+        
+        # TEMPORARY FIX: We need xf and uf to be passed to the class
+        # Let's extract them from the cost function evaluation
+        if not hasattr(self, 'xf') or not hasattr(self, 'uf'):
+            self.logger.error("Reference state xf and input uf not set!")
+            # Try to extract from the problem
+            # This is a workaround - ideally these should be passed explicitly
+            raise ValueError("xf and uf must be set in the problem definition")
+        
+        xf = self.xf
+        uf = self.uf
+        
         for k in range(N):
-            cost_terms.append(cp.quad_form(X[:, k], self.Q))
-            cost_terms.append(cp.quad_form(U[:, k], self.R))
-        # Terminal cost
-        cost_terms.append(cp.quad_form(X[:, N], self.Qf))
-        cost_terms.append(cp.quad_form(U[:, N], self.R))  # Also penalize terminal input
+            # Penalize deviation from reference: (x - xf)^T Q (x - xf)
+            x_dev = X[:, k] - xf
+            u_dev = U[:, k] - uf
+            cost_terms.append(cp.quad_form(x_dev, self.Q))
+            cost_terms.append(cp.quad_form(u_dev, self.R))
+        
+        # Terminal cost: (x_N - xf)^T Qf (x_N - xf)
+        x_dev_final = X[:, N] - xf
+        u_dev_final = U[:, N] - uf
+        cost_terms.append(cp.quad_form(x_dev_final, self.Qf))
+        cost_terms.append(cp.quad_form(u_dev_final, self.R))  # Also penalize terminal input deviation
+        
         objective = cp.Minimize(cp.sum(cost_terms))
 
         # Dynamics constraints
@@ -88,49 +131,36 @@ class CustomOptimalControlProblem(OptimalControlProblem):
         for k in range(N):
             cvxp_constraints.append(X[:, k + 1] == self.A @ X[:, k] + self.B @ U[:, k])
 
+        # DEBUG: Print constraint information
+        self.logger.info(f"Number of trajectory constraints: {len(self.trajectory_constraints)}")
+        
         # Parse input constraints from the trajectory_constraints
-        # The constraints are stored as (type, fun, lb, ub) tuples
-        for ctype, fun_constraint, lb, ub in self.trajectory_constraints:
+        for idx, (ctype, fun_constraint, lb, ub) in enumerate(self.trajectory_constraints):
             if ctype == opt.LinearConstraint:
-                # Linear constraint: A @ [x; u] in [lb, ub]
-                # For input-only constraints, A should have zeros for states
-                # Check the shape to determine if this is input-only
-                A_matrix = fun_constraint  # For LinearConstraint, 'fun' is the A matrix
-                
-                # Determine the dimension
+                A_matrix = fun_constraint
                 constraint_dim = A_matrix.shape[1]
                 
-                # Check if this is an input constraint
-                # (typically A has shape (nu, nx+nu) with zeros in first nx columns)
                 if constraint_dim == (nx + nu):
-                    # Split into state and input parts
                     A_x = A_matrix[:, :nx]
                     A_u = A_matrix[:, nx:]
                     
-                    # Check if this is an input-only constraint
                     if np.allclose(A_x, 0):
                         # Input-only constraint: A_u @ u in [lb, ub]
-                        for k in range(N + 1):  # Apply to all N+1 time points
+                        for k in range(N + 1):
                             cvxp_constraints.append(A_u @ U[:, k] >= lb)
                             cvxp_constraints.append(A_u @ U[:, k] <= ub)
                     else:
-                        # General linear constraint on both state and input
-                        for k in range(N + 1):  # Apply to all N+1 time points
-                            cvxp_constraints.append(
-                                A_x @ X[:, k] + A_u @ U[:, k] >= lb)
-                            cvxp_constraints.append(
-                                A_x @ X[:, k] + A_u @ U[:, k] <= ub)
+                        # General linear constraint
+                        for k in range(N + 1):
+                            cvxp_constraints.append(A_x @ X[:, k] + A_u @ U[:, k] >= lb)
+                            cvxp_constraints.append(A_x @ X[:, k] + A_u @ U[:, k] <= ub)
                 else:
                     self.logger.warning(
-                        f"LinearConstraint with unexpected dimension {constraint_dim} "
-                        f"(expected {nx + nu})")
+                        f"LinearConstraint with unexpected dimension {constraint_dim}")
             elif ctype == opt.NonlinearConstraint:
-                self.logger.warning(
-                    "NonlinearConstraint not yet implemented in CVXPY solver. "
-                    "Nonlinear constraints require linearization or a different approach.")
+                self.logger.warning("NonlinearConstraint not yet implemented in CVXPY solver.")
             else:
-                self.logger.warning(
-                    f"Constraint type {ctype} not recognized")
+                self.logger.warning(f"Constraint type {ctype} not recognized")
 
         # Solve the CVXPY problem
         prob = cp.Problem(objective, cvxp_constraints)
@@ -143,6 +173,37 @@ class CustomOptimalControlProblem(OptimalControlProblem):
                 "x": x0_opt, 
                 "success": False,
                 "message": f"Solver exception: {e}"
+            }
+
+        # DEBUG: Print solution info
+        self.logger.info(f"Solver status: {prob.status}")
+        self.logger.info(f"Optimal cost: {prob.value}")
+        if U.value is not None:
+            self.logger.info(f"U solution range: [{np.min(U.value)}, {np.max(U.value)}]")
+            self.logger.info(f"U[0] (velocity) - first 3 values: {U.value[0, :3]}")
+            self.logger.info(f"U[1] (steering) - first 3 values: {U.value[1, :3]}")
+        
+        if prob.status in ["optimal", "optimal_inaccurate"]:
+            self.logger.info(f"Optimization completed successfully with status: {prob.status}")
+            
+            if self.shooting:
+                result_x = U.value.flatten(order='F')
+            else:
+                result_x = np.hstack([U.value.flatten(order='F'), X.value.flatten(order='F')])
+            
+            return {
+                "x": result_x,
+                "success": True,
+                "fun": prob.value,
+                "message": f"Optimization was successful ({prob.status})."
+            }
+        else:
+            self.logger.error(f"Optimization failed with status: {prob.status}")
+            return {
+                "x": x0_opt, 
+                "success": False,
+                "fun": np.inf,
+                "message": f"Optimization failed with status: {prob.status}"
             }
 
         if prob.status in ["optimal", "optimal_inaccurate"]:

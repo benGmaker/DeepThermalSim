@@ -175,7 +175,9 @@ class ValidateCustomOptimalProblem:
             R=R,
             Qf=Qf,
             x0=x0,  # Initial state for linearization
-            u0=u0   # Initial input for linearization
+            u0=u0,  # Initial input for linearization
+            xf=xf,  # Reference/goal state (NEW!)
+            uf=uf   # Reference/goal input (NEW!)
         )
 
         # Solve the optimal control problem from x0
