@@ -182,57 +182,40 @@ class CustomOptimalControlProblem(OptimalControlProblem):
             self.logger.info(f"U solution range: [{np.min(U.value)}, {np.max(U.value)}]")
             self.logger.info(f"U[0] (velocity) - first 3 values: {U.value[0, :3]}")
             self.logger.info(f"U[1] (steering) - first 3 values: {U.value[1, :3]}")
-        
+
         if prob.status in ["optimal", "optimal_inaccurate"]:
             self.logger.info(f"Optimization completed successfully with status: {prob.status}")
             
+            # Log the CVXPY solution
+            self.logger.info(f"CVXPY U.value shape: {U.value.shape}")
+            self.logger.info(f"CVXPY U.value:\n{U.value}")
+            
+            # Return results in the format expected by OptimalControlResult
             if self.shooting:
-                result_x = U.value.flatten(order='F')
+                # The parent class will reshape this as: coeffs.reshape((ninputs, -1))
+                # So we need to flatten in a way that preserves [u1[:], u2[:], ...] structure
+                # That means we want: [u1[0], u1[1], ..., u1[N], u2[0], u2[1], ..., u2[N]]
+                # Which is ROW-major (C-order) flattening
+                result_x = U.value.flatten(order='C')
+                
+                self.logger.info(f"Flattened result_x shape: {result_x.shape}")
+                self.logger.info(f"Flattened result_x (first 10): {result_x[:10]}")
+                self.logger.info(f"Flattened result_x (around middle): {result_x[len(result_x)//2-5:len(result_x)//2+5]}")
+                
+                # Test reshaping to verify
+                test_reshape = result_x.reshape((nu, N+1), order='C')
+                self.logger.info(f"Test reshape shape: {test_reshape.shape}")
+                self.logger.info(f"Test reshape U[0,:3]: {test_reshape[0, :3]}")
+                self.logger.info(f"Test reshape U[1,:3]: {test_reshape[1, :3]}")
+                
             else:
-                result_x = np.hstack([U.value.flatten(order='F'), X.value.flatten(order='F')])
+                result_x = np.hstack([U.value.flatten(order='C'), X.value.flatten(order='C')])
             
             return {
                 "x": result_x,
                 "success": True,
                 "fun": prob.value,
-                "message": f"Optimization was successful ({prob.status})."
-            }
-        else:
-            self.logger.error(f"Optimization failed with status: {prob.status}")
-            return {
-                "x": x0_opt, 
-                "success": False,
-                "fun": np.inf,
-                "message": f"Optimization failed with status: {prob.status}"
-            }
-
-        if prob.status in ["optimal", "optimal_inaccurate"]:
-            self.logger.info(f"Optimization completed successfully with status: {prob.status}")
-            
-            # Return results in the format expected by OptimalControlResult
-            # For shooting method: return inputs only (flattened)
-            # For collocation method: return inputs + states
-            if self.shooting:
-                # Flatten U to shape (nu * (N+1),)
-                result_x = U.value.flatten(order='F')  # Fortran order for column-major
-            else:
-                # For collocation, concatenate inputs and states
-                result_x = np.hstack([U.value.flatten(order='F'), X.value.flatten(order='F')])
-            
-            return {
-                "x": result_x,
-                "success": True,
-                "fun": prob.value,  # The optimal cost
-                "message": f"Optimization was successful ({prob.status})."
-            }
-        else:
-            self.logger.error(f"Optimization failed with status: {prob.status}")
-            return {
-                "x": x0_opt, 
-                "success": False,
-                "fun": np.inf,
-                "message": f"Optimization failed with status: {prob.status}"
-            }
+                "message": f"Optimization was successful ({prob.status})."}
 
     def compute_trajectory(self, x, **kwargs):
         """
