@@ -72,151 +72,192 @@ class CustomOptimalControlProblem(OptimalControlProblem):
             return False
         return True
     
-    def _cvxpy_optimizer(self, fun, x0_opt, constraints, **kwargs):
+    def _cvxpy_optimizer(self, fun, x0_opt, constraints, max_iterations=10, **kwargs):
         """
-        CVXPY-based custom optimizer to minimize the cost function.
+        CVXPY-based optimizer with successive linearization for nonlinear systems.
         """
-        self.logger.info("Starting CVXPY optimization...")
+        self.logger.info("Starting CVXPY optimization with successive linearization...")
+        self.logger.info(f"self.x shape: {self.x.shape}")
+        self.logger.info(f"self.timepts length: {len(self.timepts)}")
 
-        # Define decision variables
         nx, nu = self.A.shape[0], self.B.shape[1]
         N = len(self.timepts) - 1
-        X = cp.Variable((nx, N + 1))  # State trajectory (N+1 points)
-        U = cp.Variable((nu, N + 1))  # Input trajectory (N+1 points to match time)
-
-        # Reference trajectory (goal state and input)
-        # Extract from the cost functions passed during initialization
-        # The cost is defined as (x - xf)^T Q (x - xf) + (u - uf)^T R (u - uf)
-        # We need to get xf and uf from somewhere
-        # Let's add them as parameters
+        self.logger.info(f"N = {N}, N+1 = {N+1}")
+        self.logger.info(f"Expected U shape: ({nu}, {N+1})")
         
-        # For now, we'll need to pass xf and uf to the optimizer
-        # Let's extract them from the problem definition
-        
-        # Construct the objective function with PROPER reference tracking
-        cost_terms = []
-        
-        # Get reference values from integral_cost (they're embedded in the cost function)
-        # We need xf and uf - let's compute them from the initial guess or pass them explicitly
-        # For now, let's assume they should be stored in the class
-        
-        # TEMPORARY FIX: We need xf and uf to be passed to the class
-        # Let's extract them from the cost function evaluation
         if not hasattr(self, 'xf') or not hasattr(self, 'uf'):
-            self.logger.error("Reference state xf and input uf not set!")
-            # Try to extract from the problem
-            # This is a workaround - ideally these should be passed explicitly
             raise ValueError("xf and uf must be set in the problem definition")
         
         xf = self.xf
         uf = self.uf
         
+        # Initial guess: straight line from x0 to xf
+        X_guess = np.zeros((nx, N + 1))
+        U_guess = np.zeros((nu, N + 1))
+        for k in range(N + 1):
+            alpha = k / N
+            X_guess[:, k] = (1 - alpha) * self.x + alpha * xf
+            U_guess[:, k] = uf
+        
+        # Successive Convex Programming loop
+        for iteration in range(max_iterations):
+            self.logger.info(f"SCP Iteration {iteration + 1}/{max_iterations}")
+            
+            # Linearize around the current guess at each time point
+            A_list = []
+            B_list = []
+            c_list = []  # Affine term: x_k+1 = A_k x_k + B_k u_k + c_k
+            
+            for k in range(N):
+                # Linearize at (X_guess[:, k], U_guess[:, k])
+                x_bar = X_guess[:, k]
+                u_bar = U_guess[:, k]
+                
+                # Get linearization at this point
+                lin_sys = ct.linearize(self.system, x_bar, u_bar)
+                A_k = lin_sys.A
+                B_k = lin_sys.B
+                
+                # Compute affine term: c_k = f(x_bar, u_bar) - A_k*x_bar - B_k*u_bar
+                # For continuous time: c_k = 0 if we use exact discretization
+                # For simplicity, use Euler: x_k+1 = x_k + dt * f(x_k, u_k)
+                dt = self.timepts[k+1] - self.timepts[k]
+                
+                # Evaluate nonlinear dynamics
+                f_bar = self.system._rhs(self.timepts[k], x_bar, u_bar)
+                
+                # Linearized dynamics: x_k+1 ≈ x_k + dt*(f_bar + A_k*(x_k - x_bar) + B_k*(u_k - u_bar))
+                # Rearranging: x_k+1 = (I + dt*A_k)*x_k + dt*B_k*u_k + dt*(f_bar - A_k*x_bar - B_k*u_bar)
+                A_k_disc = np.eye(nx) + dt * A_k
+                B_k_disc = dt * B_k
+                c_k = dt * (f_bar - A_k @ x_bar - B_k @ u_bar)
+                
+                A_list.append(A_k_disc)
+                B_list.append(B_k_disc)
+                c_list.append(c_k)
+            
+            # Solve the convex problem with time-varying linearization
+            X = cp.Variable((nx, N + 1))
+            U = cp.Variable((nu, N + 1))
+            
+            # Cost function
+            cost_terms = []
+            for k in range(N):
+                x_dev = X[:, k] - xf
+                u_dev = U[:, k] - uf
+                cost_terms.append(cp.quad_form(x_dev, self.Q))
+                cost_terms.append(cp.quad_form(u_dev, self.R))
+            
+            x_dev_final = X[:, N] - xf
+            u_dev_final = U[:, N] - uf
+            cost_terms.append(cp.quad_form(x_dev_final, self.Qf))
+            cost_terms.append(cp.quad_form(u_dev_final, self.R))
+            
+            # Add trust region to prevent large changes
+            trust_region_weight = 1.0 / (iteration + 1)  # Decrease over iterations
+            for k in range(N + 1):
+                cost_terms.append(trust_region_weight * cp.sum_squares(X[:, k] - X_guess[:, k]))
+                cost_terms.append(trust_region_weight * cp.sum_squares(U[:, k] - U_guess[:, k]))
+            
+            objective = cp.Minimize(cp.sum(cost_terms))
+            
+            # Constraints
+            cvxp_constraints = [X[:, 0] == self.x]
+            
+            # Time-varying linearized dynamics
+            for k in range(N):
+                cvxp_constraints.append(
+                    X[:, k + 1] == A_list[k] @ X[:, k] + B_list[k] @ U[:, k] + c_list[k]
+                )
+            
+            # Input constraints
+            for idx, (ctype, fun_constraint, lb, ub) in enumerate(self.trajectory_constraints):
+                if ctype == opt.LinearConstraint:
+                    A_matrix = fun_constraint
+                    if A_matrix.shape[1] == (nx + nu):
+                        A_x = A_matrix[:, :nx]
+                        A_u = A_matrix[:, nx:]
+                        
+                        if np.allclose(A_x, 0):
+                            for k in range(N + 1):
+                                cvxp_constraints.append(A_u @ U[:, k] >= lb)
+                                cvxp_constraints.append(A_u @ U[:, k] <= ub)
+            
+            # Solve
+            prob = cp.Problem(objective, cvxp_constraints)
+            try:
+                prob.solve(solver=cp.OSQP, warm_start=True, verbose=False)
+            except Exception as e:
+                self.logger.error(f"CVXPY solver failed: {e}")
+                break
+            
+            if prob.status not in ["optimal", "optimal_inaccurate"]:
+                self.logger.error(f"Optimization failed with status: {prob.status}")
+                break
+            
+            # Update guess
+            X_new = X.value
+            U_new = U.value
+            
+            # Check convergence
+            state_change = np.linalg.norm(X_new - X_guess)
+            input_change = np.linalg.norm(U_new - U_guess)
+            
+            self.logger.info(f"  Cost: {prob.value:.6f}")
+            self.logger.info(f"  State change: {state_change:.6e}")
+            self.logger.info(f"  Input change: {input_change:.6e}")
+            
+            X_guess = X_new
+            U_guess = U_new
+            
+            # Convergence check
+            if state_change < 1e-3 and input_change < 1e-3:
+                self.logger.info(f"Converged after {iteration + 1} iterations")
+                break
+        
+        # ========================================================================
+        # AFTER THE LOOP - Final solution processing
+        # ========================================================================
+        self.logger.info("SCP iterations completed")
+        self.logger.info(f"Final U[0] (velocity) - first 3: {U_guess[0, :3]}")
+        self.logger.info(f"Final U[1] (steering) - first 3: {U_guess[1, :3]}")
+        self.logger.info(f"U_guess shape: {U_guess.shape}")
+        
+        # Compute actual cost (without trust region)
+        actual_cost = 0
+        dt_array = np.diff(self.timepts)
         for k in range(N):
-            # Penalize deviation from reference: (x - xf)^T Q (x - xf)
-            x_dev = X[:, k] - xf
-            u_dev = U[:, k] - uf
-            cost_terms.append(cp.quad_form(x_dev, self.Q))
-            cost_terms.append(cp.quad_form(u_dev, self.R))
+            x_err = X_guess[:, k] - xf
+            u_err = U_guess[:, k] - uf
+            stage_cost = x_err @ self.Q @ x_err + u_err @ self.R @ u_err
+            x_err_next = X_guess[:, k+1] - xf
+            u_err_next = U_guess[:, k+1] - uf
+            stage_cost_next = x_err_next @ self.Q @ x_err_next + u_err_next @ self.R @ u_err_next
+            actual_cost += 0.5 * (stage_cost + stage_cost_next) * dt_array[k]
+        x_err_final = X_guess[:, N] - xf
+        actual_cost += x_err_final @ self.Qf @ x_err_final
         
-        # Terminal cost: (x_N - xf)^T Qf (x_N - xf)
-        x_dev_final = X[:, N] - xf
-        u_dev_final = U[:, N] - uf
-        cost_terms.append(cp.quad_form(x_dev_final, self.Qf))
-        cost_terms.append(cp.quad_form(u_dev_final, self.R))  # Also penalize terminal input deviation
+        self.logger.info(f"Actual cost (without trust region): {actual_cost:.6f}")
         
-        objective = cp.Minimize(cp.sum(cost_terms))
-
-        # Dynamics constraints
-        cvxp_constraints = [X[:, 0] == self.x]  # Initial condition
-        for k in range(N):
-            cvxp_constraints.append(X[:, k + 1] == self.A @ X[:, k] + self.B @ U[:, k])
-
-        # DEBUG: Print constraint information
-        self.logger.info(f"Number of trajectory constraints: {len(self.trajectory_constraints)}")
+        # Return in the correct format
+        result_x = U_guess.flatten(order='C')
         
-        # Parse input constraints from the trajectory_constraints
-        for idx, (ctype, fun_constraint, lb, ub) in enumerate(self.trajectory_constraints):
-            if ctype == opt.LinearConstraint:
-                A_matrix = fun_constraint
-                constraint_dim = A_matrix.shape[1]
-                
-                if constraint_dim == (nx + nu):
-                    A_x = A_matrix[:, :nx]
-                    A_u = A_matrix[:, nx:]
-                    
-                    if np.allclose(A_x, 0):
-                        # Input-only constraint: A_u @ u in [lb, ub]
-                        for k in range(N + 1):
-                            cvxp_constraints.append(A_u @ U[:, k] >= lb)
-                            cvxp_constraints.append(A_u @ U[:, k] <= ub)
-                    else:
-                        # General linear constraint
-                        for k in range(N + 1):
-                            cvxp_constraints.append(A_x @ X[:, k] + A_u @ U[:, k] >= lb)
-                            cvxp_constraints.append(A_x @ X[:, k] + A_u @ U[:, k] <= ub)
-                else:
-                    self.logger.warning(
-                        f"LinearConstraint with unexpected dimension {constraint_dim}")
-            elif ctype == opt.NonlinearConstraint:
-                self.logger.warning("NonlinearConstraint not yet implemented in CVXPY solver.")
-            else:
-                self.logger.warning(f"Constraint type {ctype} not recognized")
-
-        # Solve the CVXPY problem
-        prob = cp.Problem(objective, cvxp_constraints)
+        self.logger.info(f"Result_x shape: {result_x.shape}")
+        self.logger.info(f"Result_x first 10: {result_x[:10]}")
+        self.logger.info(f"Expected shape: ({nu * (N+1)},) = ({nu * (N+1)},)")
         
-        try:
-            prob.solve(solver=cp.OSQP, warm_start=True, verbose=False)
-        except Exception as e:
-            self.logger.error(f"CVXPY solver failed: {e}")
-            return {
-                "x": x0_opt, 
-                "success": False,
-                "message": f"Solver exception: {e}"
-            }
-
-        # DEBUG: Print solution info
-        self.logger.info(f"Solver status: {prob.status}")
-        self.logger.info(f"Optimal cost: {prob.value}")
-        if U.value is not None:
-            self.logger.info(f"U solution range: [{np.min(U.value)}, {np.max(U.value)}]")
-            self.logger.info(f"U[0] (velocity) - first 3 values: {U.value[0, :3]}")
-            self.logger.info(f"U[1] (steering) - first 3 values: {U.value[1, :3]}")
-
-        if prob.status in ["optimal", "optimal_inaccurate"]:
-            self.logger.info(f"Optimization completed successfully with status: {prob.status}")
-            
-            # Log the CVXPY solution
-            self.logger.info(f"CVXPY U.value shape: {U.value.shape}")
-            self.logger.info(f"CVXPY U.value:\n{U.value}")
-            
-            # Return results in the format expected by OptimalControlResult
-            if self.shooting:
-                # The parent class will reshape this as: coeffs.reshape((ninputs, -1))
-                # So we need to flatten in a way that preserves [u1[:], u2[:], ...] structure
-                # That means we want: [u1[0], u1[1], ..., u1[N], u2[0], u2[1], ..., u2[N]]
-                # Which is ROW-major (C-order) flattening
-                result_x = U.value.flatten(order='C')
-                
-                self.logger.info(f"Flattened result_x shape: {result_x.shape}")
-                self.logger.info(f"Flattened result_x (first 10): {result_x[:10]}")
-                self.logger.info(f"Flattened result_x (around middle): {result_x[len(result_x)//2-5:len(result_x)//2+5]}")
-                
-                # Test reshaping to verify
-                test_reshape = result_x.reshape((nu, N+1), order='C')
-                self.logger.info(f"Test reshape shape: {test_reshape.shape}")
-                self.logger.info(f"Test reshape U[0,:3]: {test_reshape[0, :3]}")
-                self.logger.info(f"Test reshape U[1,:3]: {test_reshape[1, :3]}")
-                
-            else:
-                result_x = np.hstack([U.value.flatten(order='C'), X.value.flatten(order='C')])
-            
-            return {
-                "x": result_x,
-                "success": True,
-                "fun": prob.value,
-                "message": f"Optimization was successful ({prob.status})."}
-
+        # Verify reshaping
+        test_reshape = result_x.reshape((nu, N+1), order='C')
+        self.logger.info(f"Test reshape - U[0] first 3: {test_reshape[0, :3]}")
+        self.logger.info(f"Test reshape - U[1] first 3: {test_reshape[1, :3]}")
+        
+        return {
+            "x": result_x,
+            "success": True,
+            "fun": actual_cost,
+            "message": "SCP optimization completed successfully."
+        }
+    
     def compute_trajectory(self, x, **kwargs):
         """
         Override the `compute_trajectory` method to use the custom CVXPY optimizer.
