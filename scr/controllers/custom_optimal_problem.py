@@ -251,6 +251,16 @@ class CustomOptimalControlProblem(OptimalControlProblem):
         self.logger.info(f"Test reshape - U[0] first 3: {test_reshape[0, :3]}")
         self.logger.info(f"Test reshape - U[1] first 3: {test_reshape[1, :3]}")
         
+        # At the end of _cvxpy_optimizer, before return:
+        self.logger.info(f"Actual cost (without trust region): {actual_cost:.6f}")
+
+        # Store both states and inputs for retrieval
+        self._last_X = X_guess  # Store the state trajectory
+        self._last_U = U_guess  # Store the input trajectory
+
+        # Return in the correct format
+        result_x = U_guess.flatten(order='C')
+
         return {
             "x": result_x,
             "success": True,
@@ -258,6 +268,40 @@ class CustomOptimalControlProblem(OptimalControlProblem):
             "message": "SCP optimization completed successfully."
         }
     
+    def _compute_states_inputs(self, coeffs):
+        """
+        Override parent's method to correctly handle our SCP solution format.
+        
+        For shooting methods with our SCP solver:
+        - coeffs contains flattened inputs: [u1[0], u1[1], ..., u1[N], u2[0], ..., u2[N]]
+        - We already have the states from SCP, so we use those instead of re-simulating
+        """
+        # Reshape inputs
+        ninputs = self.system.ninputs
+        N = len(self.timepts) - 1
+        
+        inputs = coeffs.reshape((ninputs, N + 1), order='C')
+        
+        self.logger.info(f"_compute_states_inputs: reshaped inputs to {inputs.shape}")
+        
+        # Use the states from SCP instead of re-simulating
+        if hasattr(self, '_last_X') and hasattr(self, '_last_U'):
+            self.logger.info("Using states from SCP optimization")
+            states = self._last_X
+            self.logger.info(f"_compute_states_inputs: using SCP states shape {states.shape}")
+        else:
+            # Fallback: simulate if SCP states not available
+            self.logger.warning("SCP states not found, falling back to simulation")
+            if self.shooting:
+                states = self._simulate_states(self.x, inputs)
+                self.logger.info(f"_compute_states_inputs: simulated states shape {states.shape}")
+            else:
+                # For collocation, states are appended after inputs
+                states = coeffs[-self.system.nstates * len(self.timepts):].reshape(
+                    self.system.nstates, -1, order='C')
+        
+        return states, inputs
+
     def compute_trajectory(self, x, **kwargs):
         """
         Override the `compute_trajectory` method to use the custom CVXPY optimizer.
@@ -298,6 +342,14 @@ class CustomOptimalControlProblem(OptimalControlProblem):
             fun=opt_result_dict.get('fun', np.nan),
             message=opt_result_dict['message']
         )
+
+        self.logger.info("Testing parent class _compute_states_inputs...")
+        test_states, test_inputs = self._compute_states_inputs(opt_result_dict['x'])
+        self.logger.info(f"test_states shape: {test_states.shape}")
+        self.logger.info(f"test_inputs shape: {test_inputs.shape}")
+        self.logger.info(f"test_inputs[0, :3]: {test_inputs[0, :3]}")
+        self.logger.info(f"test_inputs[1, :3]: {test_inputs[1, :3]}")
+        self.logger.info(f"timepts shape: {self.timepts.shape}")
 
         # Package the optimization results using the parent class result handler
         return OptimalControlResult(
