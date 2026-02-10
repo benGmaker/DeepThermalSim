@@ -1,361 +1,585 @@
-"""
-Custom Optimal Control Problem implementation using CVXPY as the backend solver.
-This module defines a `CustomOptimalControlProblem` class that inherits from `OptimalControlProblem`
-and overrides the optimization routine to utilize CVXPY for solving the optimal control problem.
-"""
-import numpy as np
-import cvxpy as cp
-import logging
-from control.optimal import OptimalControlProblem, OptimalControlResult
-import control as ct
-import scipy.optimize as opt
+"""Custom Optimal Control Problem Implementation
 
+This module demonstrates how to create a custom optimal control problem
+by inheriting from OptimalControlProblem and overriding key methods.
+This pattern allows you to implement custom optimization problems (e.g., DMC, DeePC)
+while maintaining the same MPC interface.
+
+This implementation shows a concrete matrix-based MPC formulation.
+"""
+
+import numpy as np
+import scipy as sp
+import control as ct
+from control import optimal  # Assuming the original class is here
+from control.optimal import OptimalControlProblem, OptimalControlResult
+import logging 
 topic = 'controller'
 
 class CustomOptimalControlProblem(OptimalControlProblem):
-    def __init__(self, *args, Q=None, R=None, Qf=None, x0=None, u0=None, xf=None, uf=None, **kwargs):
-        """
-        Initialize the CustomOptimalControlProblem with explicit cost matrices.
-        Automatically handles linearizing the system if it's nonlinear.
+    """Custom optimal control problem using direct matrix-based MPC formulation.
+    
+    This class demonstrates how to inherit from OptimalControlProblem and
+    implement a custom optimization problem using explicit matrix formulations.
+    
+    For nonlinear systems, this class linearizes around a reference trajectory
+    (x0, u0) or equilibrium point and builds prediction matrices for the
+    linearized system.
+    
+    Parameters
+    ----------
+    sys : InputOutputSystem
+        System to control (discrete-time, can be nonlinear)
+    timepts : array
+        Time points for the prediction horizon
+    integral_cost : callable
+        Integral cost function (from ct.optimal.quadratic_cost)
+    terminal_cost : callable, optional
+        Terminal cost function
+    trajectory_constraints : list, optional
+        Trajectory constraints
+    terminal_constraints : list, optional
+        Terminal constraints
+    Q : array, optional
+        State weight matrix (for matrix formulation)
+    R : array, optional
+        Input weight matrix (for matrix formulation)
+    Qf : array, optional
+        Terminal state weight matrix
+    x0 : array, optional
+        Linearization point for states (or equilibrium)
+    u0 : array, optional
+        Linearization point for inputs (or equilibrium)
+    xf : array, optional
+        Reference/goal state for tracking
+    uf : array, optional
+        Reference/goal input for tracking
+    initial_guess : array, optional
+        Initial guess for optimization
+    **kwargs
+        Additional arguments passed to parent class
+    
+    Example
+    -------
+    >>> # Create a custom MPC problem
+    >>> ocp = CustomOptimalControlProblem(
+    ...     sys=vehicle,
+    ...     timepts=timepts,
+    ...     integral_cost=traj_cost,
+    ...     terminal_cost=term_cost,
+    ...     Q=Q, R=R, Qf=Qf,
+    ...     x0=x0, u0=u0, xf=xf, uf=uf
+    ... )
+    >>> # Solve the problem
+    >>> res = ocp.compute_trajectory(x0)
+    """
+    
+    def __init__(self, sys, timepts, integral_cost, 
+                 terminal_cost=None,
+                 trajectory_constraints=None, 
+                 terminal_constraints=None,
+                 Q=None, R=None, Qf=None,
+                 x0=None, u0=None, xf=None, uf=None,
+                 initial_guess=None, **kwargs):
+        """Initialize the custom optimal control problem with matrix formulation."""
         
-        Parameters
-        ----------
-        Q : ndarray
-            State cost matrix
-        R : ndarray
-            Input cost matrix
-        Qf : ndarray
-            Terminal state cost matrix
-        x0 : ndarray
-            Initial state for linearization
-        u0 : ndarray
-            Initial input for linearization
-        xf : ndarray
-            Reference/goal state
-        uf : ndarray
-            Reference/goal input
-        """
-        super().__init__(*args, **kwargs)
+        # Initialize logger
+        self.logger = logging.getLogger(topic)
+        self.logger.debug("Initializing CustomOptimalControlProblem")
+        
+        # Store reference points
+        self.x0_lin = x0 if x0 is not None else np.zeros(sys.nstates)
+        self.u0_lin = u0 if u0 is not None else np.zeros(sys.ninputs)
+        self.xf = xf if xf is not None else self.x0_lin
+        self.uf = uf if uf is not None else self.u0_lin
+        
+        self.logger.debug(f"System: nstates={sys.nstates}, ninputs={sys.ninputs}, "
+                      f"noutputs={sys.noutputs}, dt={sys.dt}")
+        self.logger.debug(f"Linearization point: x0={self.x0_lin}, u0={self.u0_lin}")
+        self.logger.debug(f"Reference point: xf={self.xf}, uf={self.uf}")
+        
+        # Store cost matrices (optional, for matrix-based formulation)
         self.Q = Q
         self.R = R
-        self.Qf = Qf
-        self.logger = logging.getLogger(topic)
-
-        # Store initial state and input
-        self.x0 = np.atleast_1d(x0) if x0 is not None else None
-        self.u0 = np.atleast_1d(u0) if u0 is not None else None
+        self.Qf = Qf if Qf is not None else Q
         
-        # Store reference state and input for cost computation
-        self.xf = np.atleast_1d(xf) if xf is not None else None
-        self.uf = np.atleast_1d(uf) if uf is not None else None
-
-        # Ensure the initial state and input dimensions match
-        if not self._validate_dimensions():
-            raise ValueError("System, x0, and u0 dimensions do not match.")
-
-        # Linearize the system if required
-        if hasattr(self.system, "A") and hasattr(self.system, "B"):
-            self.A, self.B = self.system.A, self.system.B
+        # Store original system
+        self.original_sys = sys
+        
+        # Linearize if needed and extract/create state-space matrices
+        if hasattr(sys, 'A') and sys.A is not None:
+            # Already linear state-space
+            self.logger.debug("System is already in linear state-space form")
+            self.A = sys.A
+            self.B = sys.B
+            self.C = sys.C if sys.C is not None else np.eye(sys.nstates)
+            self.D = sys.D if sys.D is not None else np.zeros((sys.noutputs, sys.ninputs))
+            self.use_linearization = False
         else:
-            self.logger.info("Linearizing the system...")
-            linearized_sys = ct.linearize(self.system, self.x0, self.u0)
-            self.A = linearized_sys.A
-            self.B = linearized_sys.B
-
-    def _validate_dimensions(self):
-        """Ensure that the system's dimensions match initial conditions."""
-        if self.system.nstates != self.x0.shape[0]:
-            self.logger.error("Mismatch in dimensions: system states and x0.")
-            return False
-        if self.system.ninputs != self.u0.shape[0]:
-            self.logger.error("Mismatch in dimensions: system inputs and u0.")
-            return False
-        return True
-    
-    def _cvxpy_optimizer(self, fun, x0_opt, constraints, max_iterations=10, **kwargs):
-        """
-        CVXPY-based optimizer with successive linearization for nonlinear systems.
-        """
-        self.logger.info("Starting CVXPY optimization with successive linearization...")
-        self.logger.info(f"self.x shape: {self.x.shape}")
-        self.logger.info(f"self.timepts length: {len(self.timepts)}")
-
-        nx, nu = self.A.shape[0], self.B.shape[1]
-        N = len(self.timepts) - 1
-        self.logger.info(f"N = {N}, N+1 = {N+1}")
-        self.logger.info(f"Expected U shape: ({nu}, {N+1})")
+            # Nonlinear system - linearize around operating point
+            self.logger.debug("Linearizing nonlinear system...")
+            self._linearize_system(sys, self.x0_lin, self.u0_lin)
+            self.use_linearization = True
         
-        if not hasattr(self, 'xf') or not hasattr(self, 'uf'):
-            raise ValueError("xf and uf must be set in the problem definition")
+        self.logger.debug(f"System matrices: A shape={self.A.shape}, B shape={self.B.shape}, "
+                      f"C shape={self.C.shape}, D shape={self.D.shape}")
         
-        xf = self.xf
-        uf = self.uf
+        # Compute prediction horizon length
+        self.N = len(timepts)
+        self.logger.debug(f"Prediction horizon: N={self.N} steps")
         
-        # Initial guess: straight line from x0 to xf
-        X_guess = np.zeros((nx, N + 1))
-        U_guess = np.zeros((nu, N + 1))
-        for k in range(N + 1):
-            alpha = k / N
-            X_guess[:, k] = (1 - alpha) * self.x + alpha * xf
-            U_guess[:, k] = uf
-        
-        # Successive Convex Programming loop
-        for iteration in range(max_iterations):
-            self.logger.info(f"SCP Iteration {iteration + 1}/{max_iterations}")
+        # Build prediction matrices if we have Q and R matrices
+        if self.Q is not None and self.R is not None:
+            self.logger.debug("Building prediction matrices...")
+            self._build_prediction_matrices()
             
-            # Linearize around the current guess at each time point
-            A_list = []
-            B_list = []
-            c_list = []  # Affine term: x_k+1 = A_k x_k + B_k u_k + c_k
-            
-            for k in range(N):
-                # Linearize at (X_guess[:, k], U_guess[:, k])
-                x_bar = X_guess[:, k]
-                u_bar = U_guess[:, k]
-                
-                # Get linearization at this point
-                lin_sys = ct.linearize(self.system, x_bar, u_bar)
-                A_k = lin_sys.A
-                B_k = lin_sys.B
-                
-                # Compute affine term: c_k = f(x_bar, u_bar) - A_k*x_bar - B_k*u_bar
-                # For continuous time: c_k = 0 if we use exact discretization
-                # For simplicity, use Euler: x_k+1 = x_k + dt * f(x_k, u_k)
-                dt = self.timepts[k+1] - self.timepts[k]
-                
-                # Evaluate nonlinear dynamics
-                f_bar = self.system._rhs(self.timepts[k], x_bar, u_bar)
-                
-                # Linearized dynamics: x_k+1 ≈ x_k + dt*(f_bar + A_k*(x_k - x_bar) + B_k*(u_k - u_bar))
-                # Rearranging: x_k+1 = (I + dt*A_k)*x_k + dt*B_k*u_k + dt*(f_bar - A_k*x_bar - B_k*u_bar)
-                A_k_disc = np.eye(nx) + dt * A_k
-                B_k_disc = dt * B_k
-                c_k = dt * (f_bar - A_k @ x_bar - B_k @ u_bar)
-                
-                A_list.append(A_k_disc)
-                B_list.append(B_k_disc)
-                c_list.append(c_k)
-            
-            # Solve the convex problem with time-varying linearization
-            X = cp.Variable((nx, N + 1))
-            U = cp.Variable((nu, N + 1))
-            
-            # Cost function
-            cost_terms = []
-            for k in range(N):
-                x_dev = X[:, k] - xf
-                u_dev = U[:, k] - uf
-                cost_terms.append(cp.quad_form(x_dev, self.Q))
-                cost_terms.append(cp.quad_form(u_dev, self.R))
-            
-            x_dev_final = X[:, N] - xf
-            u_dev_final = U[:, N] - uf
-            cost_terms.append(cp.quad_form(x_dev_final, self.Qf))
-            cost_terms.append(cp.quad_form(u_dev_final, self.R))
-            
-            # Add trust region to prevent large changes
-            trust_region_weight = 1.0 / (iteration + 1)  # Decrease over iterations
-            for k in range(N + 1):
-                cost_terms.append(trust_region_weight * cp.sum_squares(X[:, k] - X_guess[:, k]))
-                cost_terms.append(trust_region_weight * cp.sum_squares(U[:, k] - U_guess[:, k]))
-            
-            objective = cp.Minimize(cp.sum(cost_terms))
-            
-            # Constraints
-            cvxp_constraints = [X[:, 0] == self.x]
-            
-            # Time-varying linearized dynamics
-            for k in range(N):
-                cvxp_constraints.append(
-                    X[:, k + 1] == A_list[k] @ X[:, k] + B_list[k] @ U[:, k] + c_list[k]
-                )
-            
-            # Input constraints
-            for idx, (ctype, fun_constraint, lb, ub) in enumerate(self.trajectory_constraints):
-                if ctype == opt.LinearConstraint:
-                    A_matrix = fun_constraint
-                    if A_matrix.shape[1] == (nx + nu):
-                        A_x = A_matrix[:, :nx]
-                        A_u = A_matrix[:, nx:]
-                        
-                        if np.allclose(A_x, 0):
-                            for k in range(N + 1):
-                                cvxp_constraints.append(A_u @ U[:, k] >= lb)
-                                cvxp_constraints.append(A_u @ U[:, k] <= ub)
-            
-            # Solve
-            prob = cp.Problem(objective, cvxp_constraints)
-            try:
-                prob.solve(solver=cp.OSQP, warm_start=True, verbose=False)
-            except Exception as e:
-                self.logger.error(f"CVXPY solver failed: {e}")
-                break
-            
-            if prob.status not in ["optimal", "optimal_inaccurate"]:
-                self.logger.error(f"Optimization failed with status: {prob.status}")
-                break
-            
-            # Update guess
-            X_new = X.value
-            U_new = U.value
-            
-            # Check convergence
-            state_change = np.linalg.norm(X_new - X_guess)
-            input_change = np.linalg.norm(U_new - U_guess)
-            
-            self.logger.info(f"  Cost: {prob.value:.6f}")
-            self.logger.info(f"  State change: {state_change:.6e}")
-            self.logger.info(f"  Input change: {input_change:.6e}")
-            
-            X_guess = X_new
-            U_guess = U_new
-            
-            # Convergence check
-            if state_change < 1e-3 and input_change < 1e-3:
-                self.logger.info(f"Converged after {iteration + 1} iterations")
-                break
-        
-        # ========================================================================
-        # AFTER THE LOOP - Final solution processing
-        # ========================================================================
-        self.logger.info("SCP iterations completed")
-        self.logger.info(f"Final U[0] (velocity) - first 3: {U_guess[0, :3]}")
-        self.logger.info(f"Final U[1] (steering) - first 3: {U_guess[1, :3]}")
-        self.logger.info(f"U_guess shape: {U_guess.shape}")
-        
-        # Compute actual cost (without trust region)
-        actual_cost = 0
-        dt_array = np.diff(self.timepts)
-        for k in range(N):
-            x_err = X_guess[:, k] - xf
-            u_err = U_guess[:, k] - uf
-            stage_cost = x_err @ self.Q @ x_err + u_err @ self.R @ u_err
-            x_err_next = X_guess[:, k+1] - xf
-            u_err_next = U_guess[:, k+1] - uf
-            stage_cost_next = x_err_next @ self.Q @ x_err_next + u_err_next @ self.R @ u_err_next
-            actual_cost += 0.5 * (stage_cost + stage_cost_next) * dt_array[k]
-        x_err_final = X_guess[:, N] - xf
-        actual_cost += x_err_final @ self.Qf @ x_err_final
-        
-        self.logger.info(f"Actual cost (without trust region): {actual_cost:.6f}")
-        
-        # Return in the correct format
-        result_x = U_guess.flatten(order='C')
-        
-        self.logger.info(f"Result_x shape: {result_x.shape}")
-        self.logger.info(f"Result_x first 10: {result_x[:10]}")
-        self.logger.info(f"Expected shape: ({nu * (N+1)},) = ({nu * (N+1)},)")
-        
-        # Verify reshaping
-        test_reshape = result_x.reshape((nu, N+1), order='C')
-        self.logger.info(f"Test reshape - U[0] first 3: {test_reshape[0, :3]}")
-        self.logger.info(f"Test reshape - U[1] first 3: {test_reshape[1, :3]}")
-        
-        # At the end of _cvxpy_optimizer, before return:
-        self.logger.info(f"Actual cost (without trust region): {actual_cost:.6f}")
-
-        # Store both states and inputs for retrieval
-        self._last_X = X_guess  # Store the state trajectory
-        self._last_U = U_guess  # Store the input trajectory
-
-        # Return in the correct format
-        result_x = U_guess.flatten(order='C')
-
-        return {
-            "x": result_x,
-            "success": True,
-            "fun": actual_cost,
-            "message": "SCP optimization completed successfully."
-        }
-    
-    def _compute_states_inputs(self, coeffs):
-        """
-        Override parent's method to correctly handle our SCP solution format.
-        
-        For shooting methods with our SCP solver:
-        - coeffs contains flattened inputs: [u1[0], u1[1], ..., u1[N], u2[0], ..., u2[N]]
-        - We already have the states from SCP, so we use those instead of re-simulating
-        """
-        # Reshape inputs
-        ninputs = self.system.ninputs
-        N = len(self.timepts) - 1
-        
-        inputs = coeffs.reshape((ninputs, N + 1), order='C')
-        
-        self.logger.info(f"_compute_states_inputs: reshaped inputs to {inputs.shape}")
-        
-        # Use the states from SCP instead of re-simulating
-        if hasattr(self, '_last_X') and hasattr(self, '_last_U'):
-            self.logger.info("Using states from SCP optimization")
-            states = self._last_X
-            self.logger.info(f"_compute_states_inputs: using SCP states shape {states.shape}")
+            self.logger.debug("Building cost matrices...")
+            self._build_cost_matrices()
+            self.use_matrix_formulation = True
         else:
-            # Fallback: simulate if SCP states not available
-            self.logger.warning("SCP states not found, falling back to simulation")
-            if self.shooting:
-                states = self._simulate_states(self.x, inputs)
-                self.logger.info(f"_compute_states_inputs: simulated states shape {states.shape}")
-            else:
-                # For collocation, states are appended after inputs
-                states = coeffs[-self.system.nstates * len(self.timepts):].reshape(
-                    self.system.nstates, -1, order='C')
+            self.logger.debug("No Q/R matrices provided, using parent class cost evaluation")
+            self.use_matrix_formulation = False
         
-        return states, inputs
-
-    def compute_trajectory(self, x, **kwargs):
-        """
-        Override the `compute_trajectory` method to use the custom CVXPY optimizer.
-
+        self.logger.debug("Calling parent class constructor...")
+        # Call parent constructor
+        super().__init__(
+            sys, timepts, integral_cost,
+            trajectory_constraints=trajectory_constraints,
+            terminal_constraints=terminal_constraints,
+            terminal_cost=terminal_cost,
+            initial_guess=initial_guess,
+            trajectory_method='shooting',
+            **kwargs
+        )
+        
+        self.logger.debug("CustomOptimalControlProblem initialization complete")
+    
+    def _linearize_system(self, sys, x0, u0):
+        """Linearize a nonlinear system around an operating point.
+        
         Parameters
         ----------
-        x : array_like
-            Initial state of the system.
-        **kwargs : dict
-            Additional arguments (squeeze, transpose, return_states, etc.)
+        sys : NonlinearIOSystem
+            Nonlinear system to linearize
+        x0 : array
+            State operating point
+        u0 : array
+            Input operating point
+        """
+        self.logger.debug(f"Linearizing around x0={x0}, u0={u0}")
+        
+        # Use control toolbox linearization
+        linsys = ct.linearize(sys, x0, u0)
+        
+        self.A = linsys.A
+        self.B = linsys.B
+        self.C = linsys.C if linsys.C is not None else np.eye(sys.nstates)
+        self.D = linsys.D if linsys.D is not None else np.zeros((sys.noutputs, sys.ninputs))
+        
+        self.logger.debug("Linearization complete")
+        self.logger.debug(f"A eigenvalues: {np.linalg.eigvals(self.A)}")
+        
+    def _build_prediction_matrices(self):
+        """Build prediction matrices Phi and Gamma.
+        
+        These matrices predict the future states based on initial state
+        and future inputs:
+        
+        X = Phi * x0 + Gamma * U
+        
+        where:
+        - X = [x(1); x(2); ...; x(N)] is the stacked state vector
+        - U = [u(0); u(1); ...; u(N-1)] is the stacked input vector
+        - x0 is the initial state
+        """
+        self.logger.debug("_build_prediction_matrices called")
+        
+        nx = self.original_sys.nstates
+        nu = self.original_sys.ninputs
+        N = self.N
+        
+        self.logger.debug(f"Building matrices for nx={nx}, nu={nu}, N={N}")
+        
+        # Initialize matrices
+        self.Phi = np.zeros((N * nx, nx))
+        self.Gamma = np.zeros((N * nx, N * nu))
+        
+        self.logger.debug(f"Phi shape: {self.Phi.shape}, Gamma shape: {self.Gamma.shape}")
+        
+        # Build Phi matrix (state transition)
+        A_power = self.A.copy()
+        for i in range(N):
+            self.Phi[i*nx:(i+1)*nx, :] = A_power
+            A_power = A_power @ self.A
+        
+        self.logger.debug("Phi matrix constructed")
+        
+        # Build Gamma matrix (input influence)
+        for i in range(N):
+            A_power = np.eye(nx)
+            for j in range(i + 1):
+                if i - j == 0:
+                    self.Gamma[i*nx:(i+1)*nx, j*nu:(j+1)*nu] = self.B
+                else:
+                    self.Gamma[i*nx:(i+1)*nx, j*nu:(j+1)*nu] = A_power @ self.B
+                if j < i:
+                    A_power = A_power @ self.A
+        
+        self.logger.debug("Gamma matrix constructed")
+        self.logger.debug(f"Phi norm: {np.linalg.norm(self.Phi):.6f}, "
+                      f"Gamma norm: {np.linalg.norm(self.Gamma):.6f}")
+    
+    def _build_cost_matrices(self):
+        """Build quadratic cost matrices H and f for the QP problem.
+        
+        The cost function is formulated as:
+        J = 0.5 * U^T * H * U + f(x0)^T * U + constant(x0)
+        
+        where U is the vector of control inputs over the horizon.
+        """
+        self.logger.debug("_build_cost_matrices called")
+        
+        nx = self.original_sys.nstates
+        nu = self.original_sys.ninputs
+        N = self.N
+        
+        Q = np.atleast_2d(self.Q)
+        R = np.atleast_2d(self.R)
+        Qf = np.atleast_2d(self.Qf) if self.Qf is not None else Q
+        
+        # Build block diagonal Q matrix for all time steps
+        Q_bar = np.zeros((N * nx, N * nx))
+        for i in range(N - 1):
+            Q_bar[i*nx:(i+1)*nx, i*nx:(i+1)*nx] = Q
+        # Terminal cost
+        Q_bar[(N-1)*nx:N*nx, (N-1)*nx:N*nx] = Qf
+        
+        self.logger.debug(f"Q_bar shape: {Q_bar.shape}, norm: {np.linalg.norm(Q_bar):.6f}")
+        
+        # Build block diagonal R matrix for all time steps
+        R_bar = np.zeros((N * nu, N * nu))
+        for i in range(N):
+            R_bar[i*nu:(i+1)*nu, i*nu:(i+1)*nu] = R
+        
+        self.logger.debug(f"R_bar shape: {R_bar.shape}, norm: {np.linalg.norm(R_bar):.6f}")
+        
+        # Compute Hessian matrix
+        # J = (Phi*x0 + Gamma*U)^T * Q_bar * (Phi*x0 + Gamma*U) + U^T * R_bar * U
+        # J = U^T * (Gamma^T * Q_bar * Gamma + R_bar) * U + ...
+        self.H = self.Gamma.T @ Q_bar @ self.Gamma + R_bar
+        
+        # Make sure H is symmetric (numerical errors can make it slightly asymmetric)
+        self.H = 0.5 * (self.H + self.H.T)
+        
+        self.logger.debug(f"Hessian H shape: {self.H.shape}, norm: {np.linalg.norm(self.H):.6f}")
+        
+        # Check positive definiteness
+        eigvals = np.linalg.eigvalsh(self.H)
+        min_eig = np.min(eigvals)
+        self.logger.debug(f"H eigenvalues: min={min_eig:.6e}, max={np.max(eigvals):.6e}")
+        if min_eig <= 0:
+            self.logger.warning(f"Hessian H is not positive definite! Min eigenvalue: {min_eig:.6e}")
+        
+        # Linear term will be computed in cost function (depends on x0)
+        # f(x0) = Gamma^T * Q_bar * Phi * x0
+        self.f_matrix = self.Gamma.T @ Q_bar @ self.Phi
+        
+        self.logger.debug(f"f_matrix shape: {self.f_matrix.shape}, "
+                      f"norm: {np.linalg.norm(self.f_matrix):.6f}")
+        
+        # Constant term (depends on x0, not needed for optimization)
+        # c(x0) = x0^T * Phi^T * Q_bar * Phi * x0
+        self.c_matrix = self.Phi.T @ Q_bar @ self.Phi
+        
+        self.logger.debug(f"c_matrix shape: {self.c_matrix.shape}, "
+                      f"norm: {np.linalg.norm(self.c_matrix):.6f}")
+        self.logger.debug("Cost matrices construction complete")
+    
+    def _cost_function(self, coeffs):
+        """Override cost function to use matrix-based QP formulation if available.
+        
+        If Q and R matrices were provided, uses efficient matrix formulation.
+        Otherwise, falls back to parent class implementation.
+        
+        Parameters
+        ----------
+        coeffs : array
+            Optimization variables (stacked input sequence U)
+        
+        Returns
+        -------
+        float
+            Cost value for the given input sequence
+        """
+        if not self.use_matrix_formulation:
+            # Fall back to parent implementation
+            return super()._cost_function(coeffs)
+        
+        self.logger.debug("_cost_function called (matrix formulation)")
+        self.logger.debug(f"coeffs shape: {coeffs.shape}, norm: {np.linalg.norm(coeffs):.6f}")
+        
+        # U is the coefficient vector (stacked inputs)
+        U = coeffs.reshape(-1, 1)
+        
+        # Linear term depends on current state
+        f = self.f_matrix @ self.x.reshape(-1, 1)
+        self.logger.debug(f"Linear term f norm: {np.linalg.norm(f):.6f}")
+        
+        # Compute quadratic cost: 0.5 * U^T * H * U + f^T * U
+        # Use item() to extract scalar from 1x1 array, or flatten()[0]
+        quadratic_term = 0.5 * (U.T @ self.H @ U).item()
+        linear_term = (f.T @ U).item()
+        constant_term = 0.5 * (self.x.reshape(1, -1) @ self.c_matrix @ self.x.reshape(-1, 1)).item()
+        
+        cost = quadratic_term + linear_term + constant_term
+        
+        self.logger.debug(f"Cost breakdown - quadratic: {quadratic_term:.6f}, "
+                    f"linear: {linear_term:.6f}, constant: {constant_term:.6f}")
+        self.logger.debug(f"Total cost: {cost:.6f}")
+        
+        # Update statistics
+        self.cost_evaluations += 1
 
+        return cost
+
+    def _compute_states_inputs(self, coeffs):
+        """Override to use matrix-based prediction if available.
+        
+        Parameters
+        ----------
+        coeffs : array
+            Optimization variables (stacked input sequence)
+        
+        Returns
+        -------
+        states : array
+            State trajectory (nstates x N)
+        inputs : array
+            Input trajectory (ninputs x N)
+        """
+        if not self.use_matrix_formulation:
+            # Fall back to parent implementation (simulation-based)
+            return super()._compute_states_inputs(coeffs)
+        
+        self.logger.debug("_compute_states_inputs called (matrix prediction)")
+        
+        nx = self.original_sys.nstates
+        nu = self.original_sys.ninputs
+        N = self.N
+        
+        # Check if we already computed this
+        if np.array_equal(coeffs, self.last_coeffs) and \
+           np.array_equal(self.x, self.last_x):
+            self.logger.debug("Using cached states and inputs")
+            return self.last_states, coeffs.reshape(nu, N)
+        
+        self.logger.debug(f"Computing new prediction for x0: {self.x}")
+        
+        # Reshape inputs
+        U = coeffs.reshape(-1, 1)
+        inputs = coeffs.reshape(nu, N)
+        
+        self.logger.debug(f"Input sequence shape: {inputs.shape}")
+        self.logger.debug(f"Input range: [{np.min(inputs):.6f}, {np.max(inputs):.6f}]")
+        
+        # Predict states: X = Phi * x0 + Gamma * U
+        X = self.Phi @ self.x.reshape(-1, 1) + self.Gamma @ U
+        states = X.reshape(nx, N)
+        
+        self.logger.debug(f"Predicted states shape: {states.shape}")
+        self.logger.debug(f"State range: [{np.min(states):.6f}, {np.max(states):.6f}]")
+        
+        # Cache results
+        self.last_x = self.x.copy()
+        self.last_states = states
+        self.last_coeffs = coeffs.copy()
+        
+        self.logger.debug("State and input computation complete")
+        
+        return states, inputs
+    
+    def compute_trajectory(self, x, squeeze=None, transpose=None, return_states=True,
+                          initial_guess=None, print_summary=True, **kwargs):
+        """Compute the optimal trajectory starting at state x.
+        
+        Overrides parent method to add logging.
+        
+        Parameters
+        ----------
+        x : array_like or number
+            Initial state for the system
+        squeeze : bool, optional
+            If True, squeeze output arrays
+        transpose : bool, optional
+            If True, transpose output arrays
+        return_states : bool, optional
+            If True, return state trajectory
+        initial_guess : array, optional
+            Initial guess for optimization
+        print_summary : bool, optional
+            If True, print summary statistics
+        **kwargs
+            Additional arguments passed to parent
+        
         Returns
         -------
         OptimalControlResult
-            Result of the optimization.
+            Result object with optimal trajectory
         """
-        self.logger.info("Computing trajectory with custom CVXPY optimizer...")
-
-        # Store the initial state (used by _cvxpy_optimizer)
-        self.x = np.atleast_1d(x)
-
-        # Call the custom optimizer
-        opt_result_dict = self._cvxpy_optimizer(
-            fun=self._cost_function,  # Passed for compatibility but not used
-            x0_opt=self.initial_guess,
-            constraints=self.constraints,
+        self.logger.debug("=" * 60)
+        self.logger.debug("compute_trajectory called")
+        self.logger.debug(f"Initial state x: {x}")
+        self.logger.debug(f"Parameters: squeeze={squeeze}, transpose={transpose}, "
+                      f"return_states={return_states}, print_summary={print_summary}")
+        
+        result = super().compute_trajectory(
+            x, squeeze=squeeze, transpose=transpose, return_states=return_states,
+            initial_guess=initial_guess, print_summary=print_summary, **kwargs
         )
+        
+        self.logger.debug(f"Optimization success: {result.success}")
+        if hasattr(result, 'cost'):
+            self.logger.debug(f"Final cost: {result.cost:.6f}")
+        self.logger.debug("compute_trajectory complete")
+        self.logger.debug("=" * 60)
+        
+        return result
+    
+    def compute_mpc(self, x, squeeze=None):
+        """Compute the optimal input at state x.
+        
+        Overrides parent method to add logging.
+        
+        Parameters
+        ----------
+        x : array_like or number
+            Initial state for the system
+        squeeze : bool, optional
+            If True, squeeze output array
+        
+        Returns
+        -------
+        array
+            Optimal input at current time
+        """
+        self.logger.debug("compute_mpc called")
+        self.logger.debug(f"Current state x: {x}")
+        
+        result = super().compute_mpc(x, squeeze=squeeze)
+        
+        self.logger.debug(f"Computed optimal input: {result}")
+        
+        return result
+    
+    def get_prediction_matrices(self):
+        """Return the prediction matrices for inspection or external use.
+        
+        Returns
+        -------
+        dict
+            Dictionary containing Phi, Gamma, H, and f_matrix (if available)
+        """
+        self.logger.debug("get_prediction_matrices called")
+        
+        if not self.use_matrix_formulation:
+            self.logger.warning("Matrix formulation not available")
+            return None
+        
+        matrices = {
+            'Phi': self.Phi,
+            'Gamma': self.Gamma,
+            'H': self.H,
+            'f_matrix': self.f_matrix,
+            'c_matrix': self.c_matrix
+        }
+        
+        self.logger.debug("Returning prediction matrices")
+        
+        return matrices
 
-        # Check if optimization was successful
-        if not opt_result_dict['success']:
-            self.logger.error("Optimization failed!")
-            self.logger.error(f"Message: {opt_result_dict['message']}")
 
-        # Convert dictionary to OptimizeResult object
-        opt_result = opt.OptimizeResult(
-            x=opt_result_dict['x'],
-            success=opt_result_dict['success'],
-            fun=opt_result_dict.get('fun', np.nan),
-            message=opt_result_dict['message']
-        )
-
-        self.logger.info("Testing parent class _compute_states_inputs...")
-        test_states, test_inputs = self._compute_states_inputs(opt_result_dict['x'])
-        self.logger.info(f"test_states shape: {test_states.shape}")
-        self.logger.info(f"test_inputs shape: {test_inputs.shape}")
-        self.logger.info(f"test_inputs[0, :3]: {test_inputs[0, :3]}")
-        self.logger.info(f"test_inputs[1, :3]: {test_inputs[1, :3]}")
-        self.logger.info(f"timepts shape: {self.timepts.shape}")
-
-        # Package the optimization results using the parent class result handler
-        return OptimalControlResult(
-            self, opt_result,
-            transpose=kwargs.get("transpose", None),
-            return_states=kwargs.get("return_states", True),
-            squeeze=kwargs.get("squeeze", None),
-            print_summary=kwargs.get("print_summary", True)
-        )
+def verify_custom_problem(sys, timepts, Q, R, x0,
+                         trajectory_constraints=None, Qf=None):
+    """Verify that the custom problem produces the same results as the original.
+    
+    Parameters
+    ----------
+    sys : InputOutputSystem
+        System to control
+    timepts : array
+        Time points for the horizon
+    Q : array
+        State weight matrix
+    R : array
+        Input weight matrix
+    x0 : array
+        Initial state
+    trajectory_constraints : list, optional
+        Trajectory constraints
+    Qf : array, optional
+        Terminal weight matrix
+    
+    Returns
+    -------
+    dict
+        Dictionary with 'original' and 'custom' results for comparison
+    """
+    log = logging.getLogger(topic)
+    log.debug("verify_custom_problem called")
+    log.debug(f"System: nstates={sys.nstates}, ninputs={sys.ninputs}")
+    log.debug(f"Initial state: {x0}")
+    log.debug(f"Horizon length: {len(timepts)}")
+    
+    # Define cost functions for original problem
+    def integral_cost(x, u):
+        return x @ Q @ x + u @ R @ u
+    
+    Qf_term = Qf if Qf is not None else Q
+    def terminal_cost(x, u):
+        return x @ Qf_term @ x
+    
+    # Create original problem
+    log.debug("Creating original OptimalControlProblem...")
+    original_problem = optimal.OptimalControlProblem(
+        sys, timepts, integral_cost,
+        trajectory_constraints=trajectory_constraints,
+        terminal_cost=terminal_cost
+    )
+    
+    # Create custom problem with same parameters
+    log.debug("Creating CustomOptimalControlProblem...")
+    custom_problem = CustomOptimalControlProblem(
+        sys, timepts, integral_cost, terminal_cost=terminal_cost,
+        Q=Q, R=R, Qf=Qf,
+        trajectory_constraints=trajectory_constraints
+    )
+    
+    # Solve both problems
+    log.debug("Solving original problem...")
+    original_res = original_problem.compute_trajectory(x0, print_summary=False)
+    
+    log.debug("Solving custom problem...")
+    custom_res = custom_problem.compute_trajectory(x0, print_summary=False)
+    
+    # Compare results
+    inputs_close = np.allclose(original_res.inputs, custom_res.inputs, rtol=1e-4, atol=1e-6)
+    states_close = np.allclose(original_res.states, custom_res.states, rtol=1e-4, atol=1e-6)
+    
+    max_input_diff = np.max(np.abs(original_res.inputs - custom_res.inputs))
+    max_state_diff = np.max(np.abs(original_res.states - custom_res.states))
+    
+    log.debug(f"Inputs match: {inputs_close}, max diff: {max_input_diff:.6e}")
+    log.debug(f"States match: {states_close}, max diff: {max_state_diff:.6e}")
+    
+    results = {
+        'original': original_res,
+        'custom': custom_res,
+        'inputs_match': inputs_close,
+        'states_match': states_close,
+        'max_input_diff': max_input_diff,
+        'max_state_diff': max_state_diff,
+    }
+    
+    log.debug("verify_custom_problem complete")
+    
+    return results
